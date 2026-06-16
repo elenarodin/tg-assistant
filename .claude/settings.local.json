@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude --version)",
+      "Read(//Users/elenarodin/.local/share/claude/versions/**)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python -c \"import telegram; print\\('python-telegram-bot', telegram.__version__\\)\")",
+      "Bash(.venv/bin/python -c \"import dotenv; print\\('dotenv ok'\\)\")",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('bot.py'\\).read\\(\\)\\); print\\('bot.py: syntax ok'\\)\")",
+      "Bash(plutil -lint ~/Library/LaunchAgents/com.lena.tgassistant.plist)"
+    ]
+  }
+}
