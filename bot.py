@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -70,20 +72,52 @@ async def still_working_notice(bot, chat_id: int, stop: asyncio.Event) -> None:
             log.exception("still-working notice failed")
 
 
-async def run_claude(prompt: str) -> tuple[int, str, str]:
-    prompt = (
-        "[SYSTEM CONSTRAINT - HARD RULE] You have access to the ms365 MCP server. Verify with ListMcpResourcesTool if uncertain. "
-        "For any calendar operation, you MUST call mcp__ms365__create-calendar-event, mcp__ms365__list-calendar-events, "
-        "mcp__ms365__get-calendar-view, mcp__ms365__update-calendar-event, or mcp__ms365__delete-calendar-event. "
-        "Calling mcp__claude_ai_Google_Calendar__* is FORBIDDEN unless the user message contains the literal string \"google calendar\". "
-        "If you believe ms365 is unavailable, you are wrong - call ListMcpResourcesTool first. "
-        "After the operation, reply with one short line confirming what you did.\n\n"
-        "[USER MESSAGE] " + prompt
-    )
+# Shared MCP guardrail prepended to every claude -p invocation. Keeps the model on the
+# ms365 calendar tools and off Google Calendar unless explicitly asked.
+SYSTEM_PREFIX = (
+    "[SYSTEM CONSTRAINT - HARD RULE] You have access to the ms365 MCP server. Verify with ListMcpResourcesTool if uncertain. "
+    "For any calendar operation, you MUST use mcp__ms365__* tools (create-calendar-event, list-calendar-events, "
+    "get-calendar-view, update-calendar-event, delete-calendar-event). "
+    "Calling mcp__claude_ai_Google_Calendar__* is FORBIDDEN unless the user message contains the literal string \"google calendar\". "
+    "If you believe ms365 is unavailable, you are wrong - call ListMcpResourcesTool first.\n"
+)
+
+# Step 1 — READ ONLY. Classify intent and, for a new booking, return the requested window
+# plus that day's events as ISO-8601 strings WITH UTC offset. Python (not the model) then
+# decides overlap, so the timezone comparison can't be fudged. The model's only jobs here
+# are natural-language time parsing and faithfully echoing what the calendar returned.
+ANALYZE_PROMPT = (
+    SYSTEM_PREFIX +
+    "[TASK — READ ONLY] Do NOT create, update, or delete anything in this step. Only read and report.\n"
+    "1. Call mcp__ms365__get-mailbox-settings and read `timeZone` — the user's local IANA timezone. "
+    "Every clock time the user gives (e.g. \"3 PM\") is in THIS timezone.\n"
+    "2. Classify intent: is the user asking to CREATE/SCHEDULE a NEW event at a specific date+time? "
+    "If yes intent=\"create\"; for anything else (listing, canceling, moving, questions) intent=\"other\".\n"
+    "3. If intent=\"create\": work out the requested start and end. If no duration is given, assume 30 minutes. "
+    "Express BOTH as ISO-8601 WITH the user's local UTC offset, e.g. 2026-06-17T15:00:00-04:00. "
+    "Then call mcp__ms365__get-calendar-view for that whole day, passing the `timezone` parameter set to the user's IANA "
+    "timezone, and list EVERY event with subject, start, end (ISO-8601 with offset, as returned).\n"
+    "Output ONLY one JSON object, no prose and no markdown fences:\n"
+    "{\"intent\":\"create|other\",\"timezone\":\"<iana|null>\",\"requested_start\":\"<iso|null>\","
+    "\"requested_end\":\"<iso|null>\",\"events\":[{\"subject\":\"...\",\"start\":\"<iso>\",\"end\":\"<iso>\"}]}\n"
+    "[USER MESSAGE] "
+)
+
+# Step 2 — the actual write (book / list / cancel / reschedule). Only reached for non-create
+# intents, or for a create that Python has already cleared as conflict-free.
+ACT_PROMPT = (
+    SYSTEM_PREFIX +
+    "Carry out the user's request. After the operation, reply with one short line confirming what you did.\n"
+    "[USER MESSAGE] "
+)
+
+
+async def run_claude(full_prompt: str) -> tuple[int, str, str]:
+    """Run a fully-built prompt through `claude -p` and return (rc, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
         str(CLAUDE_BIN),
         "-p",
-        prompt,
+        full_prompt,
         "--dangerously-skip-permissions",
         cwd=str(CLAUDE_CWD),
         stdout=asyncio.subprocess.PIPE,
@@ -95,6 +129,105 @@ async def run_claude(prompt: str) -> tuple[int, str, str]:
         stdout.decode("utf-8", errors="replace"),
         stderr.decode("utf-8", errors="replace"),
     )
+
+
+def _extract_json(text: str) -> dict | None:
+    """Pull the first {...} object out of the model's stdout and parse it.
+
+    The analyze step is told to emit bare JSON, but we tolerate stray prose or ```json
+    fences by grabbing the outermost brace span.
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        obj = json.loads(text[start : end + 1])
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _parse_dt(s: str, fallback_tz=None) -> datetime:
+    """Parse an ISO-8601 string to an aware datetime. 'Z' is normalized; naive values
+    inherit `fallback_tz` so we never mix aware/naive datetimes in a comparison."""
+    dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None and fallback_tz is not None:
+        dt = dt.replace(tzinfo=fallback_tz)
+    return dt
+
+
+def _fmt_time(dt: datetime) -> str:
+    # 3:00 PM — strip a leading zero from the hour without relying on platform %-I.
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def find_conflicts(req_start: str, req_end: str, events: list[dict]) -> list[tuple[str, datetime, datetime]]:
+    """Deterministic overlap check. Returns (subject, start, end) for every event that
+    overlaps [req_start, req_end). Overlap = existing.start < req.end AND existing.end > req.start,
+    all as timezone-aware datetimes. This is the hard gate — the model does not decide here."""
+    rs = _parse_dt(req_start)
+    re_ = _parse_dt(req_end, rs.tzinfo)
+    rs = _parse_dt(req_start, re_.tzinfo)
+    out: list[tuple[str, datetime, datetime]] = []
+    for ev in events:
+        try:
+            es = _parse_dt(str(ev["start"]), rs.tzinfo)
+            ee = _parse_dt(str(ev["end"]), rs.tzinfo)
+        except (KeyError, ValueError, TypeError):
+            continue
+        if es < re_ and ee > rs:
+            out.append((str(ev.get("subject") or "(busy)"), es, ee))
+    return out
+
+
+async def schedule_request(text: str) -> tuple[int, str]:
+    """Two-step scheduling with a deterministic conflict gate.
+
+    Step 1 analyzes the request read-only and returns the requested window + that day's
+    events. For a create, Python computes overlap; if the slot is taken we reply and NEVER
+    reach the write step. Otherwise (and for all non-create intents) step 2 performs the
+    action. Returns (rc, user_facing_reply).
+    """
+    rc, out, err = await run_claude(ANALYZE_PROMPT + text)
+    data = _extract_json(out) if rc == 0 else None
+
+    is_create = bool(
+        data
+        and data.get("intent") == "create"
+        and data.get("requested_start")
+        and data.get("requested_end")
+    )
+
+    if is_create:
+        try:
+            conflicts = find_conflicts(
+                data["requested_start"], data["requested_end"], data.get("events") or []
+            )
+        except Exception:
+            log.exception("overlap computation failed; falling through to act step")
+            conflicts = None
+
+        if conflicts:
+            subj, es, ee = conflicts[0]
+            extra = f" (+{len(conflicts) - 1} more)" if len(conflicts) > 1 else ""
+            log.info("conflict gate BLOCKED booking; %d overlap(s)", len(conflicts))
+            return 0, (
+                f"⛔ That slot is taken — '{subj}' is already booked "
+                f"{_fmt_time(es)}–{_fmt_time(ee)}{extra}. Nothing was scheduled."
+            )
+        if conflicts == []:
+            log.info("conflict gate CLEAR; proceeding to book")
+    else:
+        log.info("analyze: intent=%s (no gate)", (data or {}).get("intent", "unknown"))
+
+    # Reached for: conflict-free create, every non-create intent, or analyze failure
+    # (degrade to acting rather than dropping the user's request).
+    rc, out, err = await run_claude(ACT_PROMPT + text)
+    if rc != 0:
+        body = out.strip() or err.strip() or f"(no output, exit {rc})"
+        return rc, f"⚠️ claude exited {rc}:\n{body}"
+    return rc, (out.strip() or "(claude returned no output)")
 
 
 def chunks(text: str, size: int = TG_MSG_LIMIT):
@@ -118,17 +251,11 @@ async def process_text(bot, chat_id: int, user_id: int, text: str, heard: str | 
     notice_task = asyncio.create_task(still_working_notice(bot, chat_id, stop))
 
     try:
-        rc, out, err = await run_claude(text)
+        rc, reply = await schedule_request(text)
     except Exception as e:
         log.exception("claude invocation failed")
         reply = f"⚠️ failed to run claude: {e}"
         rc = -1
-    else:
-        if rc != 0:
-            body = (out.strip() or err.strip() or f"(no output, exit {rc})")
-            reply = f"⚠️ claude exited {rc}:\n{body}"
-        else:
-            reply = out.strip() or "(claude returned no output)"
     finally:
         stop.set()
         for t in (typing_task, notice_task):
