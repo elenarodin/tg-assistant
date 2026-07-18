@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the tg-assistant Telegram bot.
+
+  Replace the placeholders before installing (see deploy/README.md):
+    __HOME__  -> the account's home dir, e.g. /Users/elenarodin
+    __USER__  -> the account's short username, e.g. elenarodin
+    __NODE_BIN__ -> the NVM node bin dir, e.g. __HOME__/.nvm/versions/node/v14.15.0/bin
+
+  WHY USER / LOGNAME ARE HERE (do not remove):
+    Claude Code authenticates via an OAuth token stored in the macOS login
+    Keychain. Resolving that Keychain requires USER, LOGNAME, and HOME in the
+    process environment. launchd does NOT provide USER/LOGNAME by default, so
+    without these keys the spawned `claude` process reports "Not logged in" /
+    returns "401 Invalid authentication credentials" even though the login is
+    perfectly valid. This was the root cause of a real outage — leave them in.
+
+  WHY PATH INCLUDES THE NVM BIN DIR (do not remove):
+    Claude Code spawns `npx -y @softeria/ms-365-mcp-server` for the ms365 MCP
+    calendar tools. Without the node/npm/npx bin dir on PATH, that server fails
+    to launch under launchd and the model reports "no calendar tools available".
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.lena.tgassistant</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOME__/tg-assistant/.venv/bin/python</string>
+		<string>__HOME__/tg-assistant/bot.py</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>__HOME__/tg-assistant</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>USER</key>
+		<string>__USER__</string>
+		<key>LOGNAME</key>
+		<string>__USER__</string>
+		<key>NVM_DIR</key>
+		<string>__HOME__/.nvm</string>
+		<key>PATH</key>
+		<string>__HOME__/.local/bin:__NODE_BIN__:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>StandardOutPath</key>
+	<string>__HOME__/tg-assistant/launchd.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/tg-assistant/launchd.err.log</string>
+</dict>
+</plist>

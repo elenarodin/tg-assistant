@@ -112,6 +112,24 @@ ACT_PROMPT = (
 )
 
 
+def _child_env() -> dict:
+    """Environment for spawned `claude` processes.
+
+    Claude Code authenticates via an OAuth token in the macOS login Keychain (the Max
+    subscription login). Resolving that keychain requires USER/LOGNAME/HOME — under launchd
+    these are easily absent, and without them `claude` reports "Not logged in" / returns
+    401 Invalid authentication credentials even though the session is perfectly valid. We
+    inherit the parent env and guarantee those three are set so credential lookup never
+    depends on how the bot happened to be launched. (Setting ANTHROPIC_API_KEY in the env
+    would also flow through here automatically, if we ever switch to key-based auth.)
+    """
+    env = dict(os.environ)
+    env.setdefault("HOME", str(HOME))
+    env["USER"] = os.environ.get("USER") or HOME.name
+    env["LOGNAME"] = os.environ.get("LOGNAME") or env["USER"]
+    return env
+
+
 async def run_claude(full_prompt: str) -> tuple[int, str, str]:
     """Run a fully-built prompt through `claude -p` and return (rc, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
@@ -120,6 +138,7 @@ async def run_claude(full_prompt: str) -> tuple[int, str, str]:
         full_prompt,
         "--dangerously-skip-permissions",
         cwd=str(CLAUDE_CWD),
+        env=_child_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -238,6 +257,54 @@ def chunks(text: str, size: int = TG_MSG_LIMIT):
         yield text[i : i + size]
 
 
+# --- Auth-failure alerting ---------------------------------------------------
+# When a spawned `claude` fails with a 401 / auth error, warn the owner over Telegram
+# (the bot's own send path keeps working while Claude auth is down) with recovery steps.
+# Rate-limited to once per hour so a burst of failed messages can't spam the chat.
+AUTH_ALERT_INTERVAL = 3600.0  # seconds
+_last_auth_alert: float = 0.0
+
+AUTH_ERROR_MARKERS = (
+    "invalid authentication",
+    "failed to authenticate",
+    "not logged in",
+    "401",
+)
+
+AUTH_ALERT_TEXT = (
+    "⚠️ Claude auth expired — run `claude login` in Terminal, then restart me with: "
+    "launchctl kickstart -k gui/$UID/com.lena.tgassistant"
+)
+
+
+def is_auth_failure(rc: int, text: str) -> bool:
+    """True when a failed claude run looks like an authentication error. The rc != 0 guard
+    keeps a successful booking whose text merely mentions '401' from tripping the alert."""
+    if rc == 0:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in AUTH_ERROR_MARKERS)
+
+
+async def alert_auth_failure(bot, chat_id: int) -> bool:
+    """Send the recovery alert directly via Telegram, at most once per hour.
+
+    Goes through the bot's own send path (never claude), so it works even while Claude
+    auth is down. Returns True if an alert was sent, False if suppressed by the rate limit.
+    """
+    global _last_auth_alert
+    now = time.monotonic()
+    if now - _last_auth_alert < AUTH_ALERT_INTERVAL:
+        return False
+    _last_auth_alert = now  # reserve the slot before sending so a send error can't unblock a burst
+    try:
+        await bot.send_message(chat_id=chat_id, text=AUTH_ALERT_TEXT)
+        log.warning("sent auth-failure alert to chat_id=%s", chat_id)
+    except Exception:
+        log.exception("failed to send auth-failure alert")
+    return True
+
+
 async def process_text(bot, chat_id: int, user_id: int, text: str, heard: str | None = None) -> None:
     """Run a text command through the claude -p scheduling flow and reply.
 
@@ -265,6 +332,14 @@ async def process_text(bot, chat_id: int, user_id: int, text: str, heard: str | 
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+
+    # Auth-failure path: claude couldn't authenticate. Notify the owner directly over
+    # Telegram with recovery steps (rate-limited to 1/hour) instead of echoing the raw
+    # 401, and skip the normal reply so repeated failures don't spam the chat.
+    if is_auth_failure(rc, reply):
+        sent = await alert_auth_failure(bot, chat_id)
+        log.warning("auth failure on user_id=%s request; alert_sent=%s", user_id, sent)
+        return
 
     if heard is not None:
         reply = f'Heard: "{heard}"\n\n{reply}'
@@ -386,6 +461,7 @@ def _log_startup_env() -> None:
             text=True,
             timeout=30,
             cwd=str(CLAUDE_CWD),
+            env=_child_env(),
         )
         for line in (result.stdout + result.stderr).splitlines():
             if "ms365" in line:
@@ -397,6 +473,55 @@ def _log_startup_env() -> None:
         log.exception("mcp-health probe failed")
 
 
+def verify_claude_auth() -> bool:
+    """Confirm `claude` can actually authenticate before the bot accepts messages.
+
+    Runs a tiny prompt with the exact env spawned commands use. Returns True on success.
+    On failure we log a loud, actionable error (the most common cause is the launchd env
+    starving the Keychain lookup, or an expired login) but do NOT hard-exit — KeepAlive
+    would just crash-loop, and a clear log line is more useful than a restart storm.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [str(CLAUDE_BIN), "-p", "ok"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(CLAUDE_CWD),
+            env=_child_env(),
+        )
+    except Exception:
+        log.exception("auth-check probe failed to run")
+        return False
+
+    output = (result.stdout + result.stderr).strip()
+    broken = (
+        result.returncode != 0
+        or "Not logged in" in output
+        or "401" in output
+        or "authenticate" in output.lower()
+        or "Invalid authentication" in output
+    )
+    if broken:
+        log.error(
+            "AUTH CHECK FAILED — claude could not authenticate (rc=%s): %s\n"
+            "  The bot will keep running but every scheduling request will fail until this "
+            "is fixed.\n"
+            "  Most likely: the launchd process is missing USER/LOGNAME/HOME so the macOS "
+            "Keychain login can't be read, OR the `claude login` session expired.\n"
+            "  Fix: ensure the LaunchAgent sets USER and LOGNAME (see plist), then reload it; "
+            "if still failing, run `claude login` once in a terminal as this user. "
+            "Alternatively set ANTHROPIC_API_KEY in ~/tg-assistant/.env for key-based auth.",
+            result.returncode,
+            output[:500] or "(no output)",
+        )
+        return False
+    log.info("auth check OK — claude authenticated")
+    return True
+
+
 def main() -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     log.info(
@@ -405,6 +530,10 @@ def main() -> None:
         CLAUDE_CWD,
     )
     _log_startup_env()
+
+    # Validate claude auth up front so a broken login surfaces clearly in the log at
+    # startup rather than as a cryptic 401 on the user's first message.
+    verify_claude_auth()
 
     # Load the speech-to-text model once, before polling, so the first voice note
     # doesn't pay the load cost (or fail under launchd). Model files are cached under
